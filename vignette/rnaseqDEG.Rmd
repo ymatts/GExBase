@@ -1,0 +1,932 @@
+---
+title: "RNA-seq遺伝子発現差異解析"
+author:
+- Yusuke MATSUI
+- Graduate School of Medicine
+- Nagoya University
+output:
+  slidy_presentation: default
+  ioslides_presentation:
+    footer: Copyright (c) 2019, Yusuke MATSUI
+    widescreen: yes
+---
+
+```{r setup,echo=F}
+knitr::opts_knit$set(echo = F,root.dir = "~/Dropbox/matsui/gitR/LectureR/")
+```
+
+
+## 発現差異解析(Differential Gene Expression Analysis; DGE)とは
+- 群間で差異のある分子群および生物学的な機能など調べる一連の解析
+　
+```{r echo=F,out.width="70%",fig.align='center'}
+library(pheatmap)
+case = matrix(rnorm(100,3,1),nrow = 20,ncol = 5)
+ctr = matrix(rnorm(100,1,1),nrow = 20,ncol = 5)
+colnames(case) = paste("Case",1:ncol(case))
+colnames(ctr) = paste("Ctr",1:ncol(ctr))
+x = cbind(case,ctr)
+rownames(x) = paste("gene",1:nrow(x))
+pheatmap(x,scale = "row")
+```
+
+## DGEの流れ
+1. データ取得
+2. データの前処理
+3. 群間比較
+    - 分散分析
+4. 遺伝子セット解析
+    - Gene Set Enrichment Analysis (GSEA)
+    - Fisher's Exact Test (FET)
+
+
+# データ取得
+
+## 例題データの取得
+ - [Law et al. 2018](https://f1000research.com/articles/5-1408)のプロトコルに沿った解析を実習
+ - 下記サイトからデータ(GSE63310_RAW.tar)をダウンロードおよび解凍
+   - http://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE63310&format=file
+ - data/フォルダにフォルダごと移動
+
+## ホームディレクトリの設定
+```{r,setwd, eval=F}
+home = "~/hgc2019"
+setwd(home)
+```
+
+## 例題データファイル一覧取得
+ - ファイル一覧の取得
+```{r getfiles,echo=TRUE}
+files = list.files("data/GSE63310_RAW",full.names = TRUE)
+files[1:3]
+```
+
+ - 二つのファイルは今回の解析からは除外する
+```{r}
+selectfiles = 
+  !(files %in% 
+      c("data/GSE63310_RAW/GSM1545537_mo906111-1_m09611-2.txt.gz",
+                  "data/GSE63310_RAW/GSM1545543_JMS9-CDBG.txt.gz"))
+files = files[selectfiles]
+```
+
+## 例題データの読み込み
+- edgeRパッケージのreadDGE関数を用いる
+- ファイルパス一覧を引数に渡すと一括で読み込んでくれる
+    - 解凍せずに渡せる
+- 読み込む列をcolumnsで指定できる
+    - 今回は１列目と３列目
+```{r readfiles,echo=TRUE,warning=FALSE}
+library(limma)
+library(edgeR)
+x = readDGE(files,columns = c(1,3))
+```
+
+
+# 前処理（アノテーション）
+
+## アノテーション処理
+- サンプル情報
+    - サンプル名の整理（ファイル名のままだと可視化時にわかりにくい）
+    - 関連情報（レーン情報やグループ情報等）の整理
+- 転写物情報
+    - 転写物ID (ENTREZID等)と染色体・遺伝子シンボルの対応づけ
+- まずはどのような情報な情報があるのか確認してみよう
+
+
+## 読み込んだデータの確認
+ - xのデータ構造を確認
+ - readDGEで読み込んだオブジェクトはDGEList型
+ - 二つのリスト要素持っている
+```{r dim}
+class(x)　# オブジェクトの型
+names(x) # 要素名
+```
+
+## サンプル名の初期値
+- ファイル名のままになっている
+- 可視化するときにこのままでは見にくいのでリネームが必要
+```{r}
+colnames(x)
+```
+
+## サンプル名の初期値
+- `count`のリスト要素にもサンプル名が付いている
+- `DGEList`型では`colnames(x)`の変更が`colnames(x$count)`にも反映される
+```{r}
+colnames(x$counts)
+```
+
+
+## 読み込んだデータの確認（データ構造）
+- データフレーム型と行列型
+- sample要素にはサンプル情報、countsには発現カウント数が格納されている
+```{r}
+class(x$samples)
+class(x$counts)
+```
+
+## 読み込んだデータの確認（何行何列か確認）
+-  `sample`は9行4列の情報が入っている
+-  `counts`は27179行9列の情報が入っている
+```{r}
+dim(x$samples)
+dim(x$counts)
+```
+
+## `sample`の各列名を調べる
+- `x$sample`に色々なサンプル情報が格納 (追加可能)
+- `files`,`group`,`lib.size`,`norm.factor`の４つの情報が9サンプル分ある
+```{r}
+colnames(x$samples)
+```
+
+## `counts`の各列名を調べる
+```{r}
+colnames(x$counts)
+```
+
+
+## `sample`の中身を確認
+- `head()`関数は最初の数行を表示する関数
+- 行にサンプル, 列に属性情報がついている
+- `sample`には9サンプル分の属性情報が入っている
+```{r}
+head(x$samples,n=3)
+```
+
+## `counts`の中身を確認
+- 行には遺伝子のENTREZID, 列にはサンプル名が入っている
+- 27179個の転写物分のリード数
+```{r}
+head(x$counts,n=3)
+```
+
+
+## `sample`中の`files`,`group`の中身を詳しく確認
+- `files`: 読み込んだ際のファイルパス
+- `group`: サンプルのグループ情報（初期値は全て同じ群）
+```{r}
+x$samples$files[1:5]
+x$samples$group[1:5]
+```
+
+##` sample`中の`lib.size`,`norm.factor`の中身を詳しく確認
+- `lib.size`:ライブラリサイズ(lib.size)
+- `norm.factors`:正規化係数。サンプル間のバイアス補正のための係数（初期値は全て1）
+```{r}
+x$samples$lib.size[1:5]
+x$samples$norm.factors[1:5]
+```
+
+
+## アノテーション情報編集の流れ
+- `sample`情報の編集
+    1. サンプル名の簡易化
+    2. サンプル属性の編集
+- `counts`情報の編集
+    3. 転写物の遺伝子シンボルへのマッピング
+        - Multi mapping genesの除去
+
+## 1. サンプル名の編集 (簡易化)
+- サンプル名がファイルパスになっているため短縮する
+- `basename()`関数はファイルパスから最下層のファイル名のみを取り出す関数
+```{r}
+colnames(x)[1:2] #Before
+samplenames = basename(colnames(x)) #ファイルパスからファイル名のみ抽出
+samplenames[1:2]
+```
+
+## 1. サンプル名の簡易化
+1. まずファイルパスからファイル名だけを抽出する
+2. "GSM",".txt"は不要なので除去する
+```{r}
+
+samplenames = gsub("GSM","",samplenames)
+samplenames[1:2]
+samplenames = gsub(".txt","",samplenames)
+samplenames[1:2] #After
+```
+
+
+## 1. サンプル名の簡易化
+- xの列名に編集したサンプル名をセット
+- 自動的にx$countsに格納されているサンプル名(列名)も更新される
+```{r}
+colnames(x) = samplenames
+colnames(x)[1:5]
+colnames(x$counts)[1:5]
+```
+
+## 2. サンプル属性の編集（グループ情報）
+- グループ情報の編集
+- 初期値は全て1 (全サンプルが同じグループ)
+    - 条件間比較の際に用いる
+- 今回は論文に従い細胞種 basal, LP, MLを設定
+    - 数値以外の情報は基本的にfactor型に変換`(as.factor())`関数
+```{r}
+group <- as.factor(c("LP", "ML", "Basal",
+                     "Basal", "ML", "LP", "Basal", "ML", "LP")) 
+x$samples$group = group
+x$samples$group
+```
+
+## サンプル属性の編集（レーン情報）
+- 補足情報の編集
+  - レーン情報（バッチ）の設定
+  - バッチエフェクト除去に用いる
+```{r}
+lane = as.factor(rep(c("L004","L006","L008"), times=c(3,4,2))) 
+x$samples$lane = lane
+x$samples$lane
+```
+
+## 編集後のサンプル属性
+```{r}
+head(x$samples,n=3)
+```
+
+## 3. 遺伝子情報の編集
+- 遺伝子アノテーション
+    - 転写物の染色体番号や遺伝子シンボルとの対応等
+- アノテーション情報の取得方法
+1. biomaRtパッケージを利用する
+2. organismごとのパッケージを利用する（今回紹介）
+    - Mus.musculus
+    - Homo.sapiens etc
+
+## アノテーションデータベースの取得
+- マウスモデルのアノテーションデータベースを取得
+
+## Mus.musculusにある情報一覧
+```{r,warning=F,message=F}
+# BiocManager::install("Mus.musculus") # if not installed
+library(Mus.musculus) 
+columns(Mus.musculus)
+```
+
+## アノテーションデータベースから情報抽出
+- `ENTREZID`を遺伝子シンボルと染色体番号にマッピングするために必要な情報のみ選択
+```{r,warning=F,message=F}
+geneid=rownames(x)
+genes=select(Mus.musculus,
+               keys=geneid,columns=c("SYMBOL","TXCHROM"), 
+               keytype="ENTREZID")
+dim(genes)
+head(genes,n=2)
+```
+
+## 重複したマッピング（multi mapping）
+- 同じ遺伝子IDが複数のアノテーションにヒット
+```{r,echo=T}
+tb = table(genes$ENTREZID)
+dupId = names(tb[tb > 1])
+genes[genes$ENTREZID %in% dupId[5:6],]
+```
+
+## Multi mappingを事前にフィルタ 1
+- 事前情報があれば、それを元に重複を除去
+- 事前情報がなければ、機械的に重複を除去
+    - `duplicated()`関数は重複している一つ目以外の要素を`TRUE/FALSE`で返す
+    - 下記のコード例を参照
+```{r}
+g = rep(LETTERS[1:3],each=3)
+duplicated(g)
+```
+## Multi mappingを事前にフィルタ 2
+- 重複している要素を選択
+```{r}
+g[duplicated(g)]
+```
+
+- 重複して「いない」要素を選択
+    - 重複しているもののうち一つ目の要素のみ機械的に選択
+````{r}
+g[!duplicated(g)]
+```
+
+## Multi mappingを事前にフィルタ 3
+- `duplicated()`関数を用いて重複を機械的に除去
+```{r}
+genes = genes[!duplicated(genes$ENTREZID),]
+```
+
+- 重複がないか確認
+```{r}
+!all(duplicated(genes))
+```
+
+## 遺伝子IDのアノテーションを追加
+- 発現データ`x`に`genes`という変数を追加
+- 発現量の行名にある遺伝子IDと同じ並びにしておくと便利
+```{r}
+x$genes = genes[match(rownames(x$counts),genes$ENTREZID),]
+head(cbind(targetIndex=match(rownames(x$counts),genes$ENTREZID),ref=rownames(x$counts),target=x$genes[,1]))
+```
+
+## `match()`関数（補足）
+```{r}
+(ref = c("S","T","A","R","W","A","R","S"))
+(target = LETTERS)
+```
+
+## `match()`関数（補足）
+- `match(ref,target)`は`ref`の各要素が`target`の要素に対応する添字を返す関数
+```{r}
+(index = match(ref,target))
+target[index]
+```
+
+# 前処理（遺伝子発現量）
+
+## 発現量の正規化について
+- fastqのマッピング後に得られる発現量＝リードのカウント数
+- リード数はライブラリサイズや遺伝子長など様々な要因に影響される
+- 正規化して転写物/遺伝子の真の発現量を定量化することが重要
+```{r,echo=F}
+x$counts[1:3,1:3]
+```
+
+## ライブラリサイズ（参考）
+- トータルのリード数
+```{r}
+x$samples$lib.size
+```
+
+## ライブラリサイズと発現量（参考）
+- ライブラリサイズと発現量が相関傾向
+- 正規化により除去している
+```{r,echo=F,out.width="80%"}
+p = par(mfrow=c(3,3),mar=c(4,4,3,1))
+for(i in 1:9){
+plot(x$samples$lib.size,x$counts[i,],xlab="library size",
+     ylab="read counts",main=x$genes$SYMBOL[i],pch=16)
+  grid()
+}
+par(p)
+```
+
+## Count Per Millon（参考）
+```{r,echo=T}
+cpm = cpm(x) # CPM without logarithm calculation
+```
+
+- CPM = $\frac{count}{\frac{library.size}{10^6}}\times norm.factor$ = $\frac{count}{library.size}10^6\times norm.factor$
+- 100万リード数単位のライブラリサイズでカウント値を補正
+- ライブラリサイズによるカウント数のバイアスを除去
+- norm.factorは後述するTMM正規化係数（初期値は`1`）
+
+## Count Per Millon補正後（参考）
+```{r,echo=F,out.width="80%"}
+p = par(mfrow=c(3,3),mar=c(4,4,3,1))
+for(i in 1:9){
+plot(x$samples$lib.size,cpm[i,],xlab="library size",
+     ylab="CPM",main=x$genes$SYMBOL[i],pch=16)
+  grid()
+}
+par(p)
+```
+
+## log2 Count Per Million（参考）
+```{r,echo=T}
+lcpm = cpm(x, log=TRUE) # log2CPM
+```
+- 他の統計解析・可視化をするときに用いる変換
+- あとで紹介する`voom`関数でも内部でlog2変換を自動で行っている
+- log$_2(0)=-\infty$を防ぐため自動的にオフセット値を足している
+    - log$_2(CPM)+2/L$
+    - $L$はライブラリサイズの平均値
+
+## CPMとlog2(CPM)（参考）
+- logスケール変換で極端に大きいか小さい発現量のばらつきが縮小される
+- 発現量のスケールが$[0,\infty]$から$[-\infty,+\infty]$
+  - 一般にlog変換により（対数）正規性が期待できる
+  - ヒートマップの作成でも対数変換をして用いる
+```{r,echo=F,out.width="70%"}
+p = par(mfcol=c(1,2))
+hist(cpm,breaks = 1000,xlim=c(0,5000))
+hist(lcpm)
+par(p)
+```
+
+```{r,echo=F,eval=T}
+L = mean(x$samples$lib.size) * 1e-6
+M = median(x$samples$lib.size) * 1e-6
+```
+
+## 低発現遺伝子群の除去 1
+- RNA-seqによる発現量データでは低発現ないし０カウントが非常に多い
+- 統計学では「ゼロ過剰(zero inflated)」の分布と言われる
+- 非常に小さな値は見かけの変動が大きい=偽陽性率が上昇！
+    - ex: $0.01 / 0.0001 = 100$倍の変動
+- 事前に低発現遺伝子は除去することが多い
+```{r,echo=F,out.width="50%"}
+hist(lcpm)
+```
+
+## 低発現遺伝子群の除去 2 
+- 全てのサンプル（9サンプル）でリード数がゼロの遺伝子群
+```{r}
+table(rowSums(x$counts==0) == 9)
+```
+
+- およそ19%の遺伝子で発現量が0となっている
+
+## 低発現遺伝子群の除去 3
+- Chen & Smyth (2016) によるフィルタリング戦略
+    - CPMに基づき$n$サンプルにおいて$k$以上の遺伝子群のみを用いる
+        - $n$: 最も数の少ないグループのサンプル数
+        - $k$: あらかじめ決めた最小のカウント数（デフォルトは10）
+
+
+```{r,echo=F}
+pre_x = x
+```
+## 低発現遺伝子群の除去 4
+```{r}
+keep.exprs = filterByExpr(x, group=group)
+x = x[keep.exprs,, keep.lib.sizes=FALSE]
+dim(x)
+```
+- `filterByExpr()`関数を用いる
+- `keep.lib.size=FALSE`はライブラリサイズの再計算をする否か (なくても影響ない)
+
+## 低発現遺伝子群の除去 4
+```{r,echo=F}
+p = par(mfcol=c(1,2))
+hist(cpm(pre_x,log=T),xlab="log2(CPM)",main="Pre-filtering")
+hist(cpm(x,log=T),xlab="log2(CPM)",main="Post-filtering")
+par(p)
+```
+
+
+##  Trimmed Mean Mvalue (TMM)
+- 仮定：全てのサンプルにおける発現量は類似した範囲で分布する
+- 問題：ライブラリサイズ以外の影響によるばらつきも生じる
+- 代表的な方法：
+    - Trimmed Mean Mvalue, Quantile normalization etc.
+- CPMによるライブラリサイズの補正+$\alpha$
+- ライブラリサイズ補正のみよりも変動遺伝子群同定の偽陽性率が低くなる
+    - [Robinson and Oshlack 2010]("https://genomebiology.biomedcentral.com/articles/10.1186/gb-2010-11-3-r25")
+
+## Trimmed Mean Mvalue
+- サンプル間で変動しない遺伝子群の発現比で補正
+- あるサンプルをレファレンスとして他のサンプル間で補正係数算出
+- オブジェクト`x`の`x$norm.factor`が初期値から自動更新される
+```{r}
+x = calcNormFactors(x,method="TMM")
+x$samples$norm.factors
+```
+
+- TMM補正係数を掛け合わせたCPMを得るには要再計算
+```{r}
+cpm = cpm(x) #補正後のCPM
+lcpm = cpm(x,log=TRUE)
+```
+
+
+## TMM補正前後
+```{r,echo=F}
+library(RColorBrewer)
+nsamples <- ncol(x)
+col <- brewer.pal(nsamples, "Paired")
+x2 = x
+x2$samples$norm.factors = 1
+par(mfrow=c(1,2))
+lcpm = cpm(x2, log=TRUE)
+boxplot(lcpm, las=2, col=col, main="")
+title(main="A. Example: Unnormalised data",ylab="Log-cpm")
+x2 <- calcNormFactors(x2)  
+lcpm <- cpm(x2, log=TRUE)
+boxplot(lcpm, las=2, col=col, main="")
+title(main="B. Example: Normalised data",ylab="Log-cpm")
+```
+
+## サンプル間のばらつき可視化
+- 着目する現象とは関係のない因子の影響をチェック
+    - データ取得時や測定時のテクニカルなバイアス、共変量の影響など
+      - 例　バッチエフェクト：sequencing laneによるバイアス
+- 次元縮小法を用いてサンプルのグループ構造を可視化
+
+```{r,echo=F,out.width="60%",fig.align='center'}
+label = x$samples$group
+laneCol = as.numeric(x$samples$lane)
+p = par(mfcol=c(1,2),mar=c(3,3,1,1))
+plotMDS(lcpm,labels=label,col=laneCol,dim.plot = c(1,2))
+plotMDS(lcpm,labels=label,col=laneCol,dim.plot = c(3,4))
+par(p)
+```
+
+## 多次元尺度構成法
+- 1,2次元目はグループ間の違いを反映している考えられる
+```{r,out.width="60%",fig.align='center'}
+lcpm = cpm(x,log=TRUE) #フィルタリングCPMの再計算
+label = x$samples$group
+laneCol = as.numeric(x$samples$lane)
+plotMDS(lcpm,labels=label,col=laneCol,dim.plot = c(1,2))
+```
+
+## 多次元尺度構成法 2
+- 他の次元（3,4次元目）でも確認
+- 1,2次元目で説明できないばらつきを説明
+- 次元の並びはばらつきの大きい順に並んでいる
+- バッチの影響を反映していると考えられる
+```{r,out.width="60%",fig.align='center'}
+plotMDS(lcpm,labels=label,col=laneCol,dim.plot = c(3,4))
+```
+
+## 遺伝子ごとの平均値-分散トレンド
+- 低発現量領域へ向かって分散が大きくなる
+```{r,echo=F,fig.align="center"}
+#p = par(mfcol=c(1,2))
+design <- model.matrix(~0+group+lane)
+colnames(design) <- gsub("group", "", colnames(design))
+contr.matrix <- makeContrasts(
+   BasalvsLP = Basal-LP, 
+   BasalvsML = Basal - ML, 
+   LPvsML = LP - ML, 
+   levels = colnames(design))
+
+v <- voom(x, design, plot=TRUE)
+```
+
+## 平均-分散トレンドの意味
+- 分散は変動遺伝子同定の統計モデルにおける重要パラメーター
+    - `測定誤差`の影響を出来るだけ除去したい
+- 分散を`測定誤差`と`生物学的ばらつき`に分解([Law et al. 2014](https://genomebiology.biomedcentral.com/articles/10.1186/gb-2014-15-2-r29))
+    - `生物学的ばらつき`はリード数に依存せず一定
+    - `測定誤差`のみがリード数に依存して変化する
+
+
+## voom: 平均-分散トレンド除去による発現量補正
+- サンプルごとに各遺伝子の補正係数を推定([Law et al. 2014](https://genomebiology.biomedcentral.com/articles/10.1186/gb-2014-15-2-r29))
+- サンプル間のライブラリサイズが大きく異なる場合に極めて有効
+- 偽陽性率を抑えられる
+- 方法は後述
+```{r,echo=F,fig.align="center"}
+p = par(mfcol=c(1,2))
+design <- model.matrix(~0+group+lane)
+colnames(design) <- gsub("group", "", colnames(design))
+contr.matrix <- makeContrasts(
+   BasalvsLP = Basal-LP, 
+   BasalvsML = Basal - ML, 
+   LPvsML = LP - ML, 
+   levels = colnames(design))
+
+v <- voom(x, design, plot=TRUE)
+vfit <- lmFit(v, design)
+vfit <- contrasts.fit(vfit, contrasts=contr.matrix)
+efit <- eBayes(vfit)
+plotSA(efit, main="Final model: Mean-variance trend")
+par(p)
+```
+
+## limmaによる発現差異解析モデル
+- 線形回帰モデル(分散分析のイメージに近いモデル)
+- ベクトル表記：$E[Y_{gi}]=\mu_{gi}=x_i^T\beta_g$
+    - $Y_{gi}$: サンプル$i$, 遺伝子$g$の発現量
+    - $x_i$: サンプル$i$の共変量(サンプル情報, 水準)
+    - $\beta_g$: 推定量（水準の効果）を表し、$\beta_{gi}$がゼロか否かを検定する
+- 行列表記：$E[Y_g]=X\beta_g$: (サンプルをまとめて表記)
+    - $Y_g$: 遺伝子$g$の発現量
+    - $X_g$（デザイン行列）: サンプル情報(デザイン行列; design matrix)
+    
+
+## limmaによる発現差異解析のフロー
+0. データの前処理（これまでの部分）
+1. デザイン行列の設計
+    - 比較対照の実験デザインはここで決まる（最も重要）
+    - ブロックデザインの導入や対応付き検定などもここで設定可能（後述）
+    - バッチエフェクトもここで定義可能
+2. voomによる分散補正
+3. 回帰モデルによる発現差異解析
+    - 経験ベイズ法に基づくmoderate-t統計量を用いた発現差異検定
+4. 比較条件間の変動遺伝子群の比較
+5. 変動遺伝子群解釈のための遺伝子セット解析
+
+
+## 1. デザイン行列
+```{r}
+group = x$samples$group
+lane = x$samples$lane
+design <- model.matrix(~0+group+lane)
+colnames(design) <- gsub("group", "", colnames(design))
+design
+```
+
+## デザイン行列のバリエーション
+- 対応付き検定
+- 
+
+## 1. デザイン行列（コントラスト行列）
+- デザイン行列に基づき各水準の効果を推定
+- 各水準間の効果差を推定するためにコントラスト行列を作成
+```{r}
+contr.matrix = makeContrasts(
+   BasalvsLP = Basal-LP,
+   BasalvsML = Basal - ML, 
+   LPvsML = LP - ML,
+   levels = colnames(design))
+contr.matrix
+```
+
+## 2. voomによる分散補正
+```{r,out.width="80%",fig.align="center"}
+v = voom(x, design, plot=TRUE)
+v
+```
+
+## 3. 回帰モデルによる発現差異解析
+- `lmFit()`：デザイン行列に基づく回帰係数を求める
+- `contrasts.fit()`：`lmFit`とコントラスト行列に基づき条件間の比較を行う
+- `eBayes()`；経験ベイズに基づくp値を計算
+```{r}
+vfit = lmFit(v, design)
+vfit = contrasts.fit(vfit, contrasts=contr.matrix)
+efit = eBayes(vfit)
+```
+
+
+## 4. 変動遺伝子群の比較
+- Direction (up/down)を考慮した変動遺伝子群の数（デフォルトは有意水準`5%`）
+- `decideTests`では比較条件数の多重検定補正を行う
+- 次で説明する`treat()`関数とは異なりp値のみから比較条件間の多重補正を行う
+    - より厳密な比較条件間の変動遺伝子群の比較には`treat`を用いる方が良い
+```{r}
+summary(decideTests(efit))
+```
+
+## 4. 変動遺伝子群の比較 2
+- ベン図による図示
+- `vennDiagram()`関数に`decideTests()`関数の結果を入れる
+```{r,out.width="50%",fig.align="center"}
+dt0 = decideTests(efit)
+vennDiagram(dt0,circle.col = 1:ncol(dt0),main = "Differential Expressed Genes (LFC >= 0)")
+```
+
+## 4. 変動遺伝子群の比較 3
+- `treat()`関数
+    - `decideTests()`よりも厳密な比較
+    - log fold change (lfc) のフィルターを加えて改めてp値を算出
+    - `lfc`よりも十分に大きい変動かを検定する
+    - `lfc=0`にすればデフォルトの最も条件の緩い`eBayes()`と同じ結果となる
+- 変動遺伝子が多すぎる場合や発現変動の大きい遺伝子群に着目したいときにに有効
+```{r}
+tfit = treat(efit,lfc = 1)
+summary(decideTests(tfit))
+```
+
+## 4. 変動遺伝子群の比較 4
+```{r,out.width="70%",fig.align="center"}
+dt = decideTests(tfit)
+vennDiagram(dt,circle.col = 1:ncol(dt),main="Differential Expressed Genes (LFC>=1)")
+```
+
+## 4. 変動遺伝子群の比較 5
+- ベン図中の分子群を取り出す
+- `decideTest`で得られた結果には遺伝子（行）ごとに条件間（列）で有意か否かの情報がある
+- `1 (Up), 0 (Not significant), -1 (Down)`を表している
+- この値を用いて条件フィルタを行えばベン図に対応した遺伝子群を得られる
+```{r}
+dt
+```
+
+## 4. 変動遺伝子群の比較 6
+- 共通した遺伝子群を取り出す例を示す
+```{r}
+de.common = which(dt[,1]!=0 & dt[,2]!=0 & dt[,3]!=0)
+length(de.common)
+head(tfit$genes$SYMBOL[de.common], n=20)
+```
+
+## 発現差異解析の結果を保存（補足）
+- `write.fit()`関数で全ての結果を保存
+    - `file=**.csv`および`sep=","`とすることでcsv形成で保存
+    - `row.names=F`にしておけば保存してエクセルで開く際に列名がずれなくなる
+- `decideTest()`の結果も付加されて保存
+```{r}
+write.fit(tfit,dt,file = "limma_result.csv",row.names = F,sep = ",")
+```
+
+
+## 個々の変動遺伝子群を全て確認する（補足）
+- `topTreat()`関数で上位の変動遺伝子を表示する
+- `coef`引数に`contr.matrix`で定義した条件比較名を指定
+- 下の例は`BasalvsLP`の結果
+- `number`はいくつまでに結果を取り出すかの引数
+    - `Inf`にすると「全て」
+    - それを`head()`関数で最初の3行だけ表示している
+```{r}
+head(topTreat(tfit,coef="BasalvsLP",number = Inf),n=3)
+```
+
+## Mean-Difference Plot
+- 変動遺伝子群の可視化
+    - 横軸：CPMの平均値
+    - 縦軸：LFC
+    - 色：赤 (Up) 緑（Down）黒(Not significant)
+```{r,out.width="40%",fig.align="center"}
+plotMD(tfit, column="BasalvsLP", status=dt[,"BasalvsLP"], main="BasalvsLP", xlim=c(-8,13))
+```
+
+## Volcano Plot
+- 変動遺伝子群の可視化 2
+    - 横軸：補正済みP値
+    - 縦軸：LFC
+    - 色：赤 (Up) 緑（Down）黒(Not significant)
+```{r,out.width="50%",fig.align="center"}
+volcanoplot(tfit,coef="BasalvsLP",highlight = 30,names = tfit$genes$SYMBOL)
+```
+
+
+## ヒートマップ
+```{r,echo=F,warning=F,message=F,fig.align="center"}
+library(pheatmap)
+ntop = 100
+BasalvsLP = topTreat(tfit,coef="BasalvsLP",number = Inf)
+topGeneIds = BasalvsLP$ENTREZID[1:ntop]
+topGenes = BasalvsLP$SYMBOL[1:ntop]
+topExpr = lcpm[rownames(lcpm) %in% topGeneIds, ]
+pheatmap(topExpr,scale = "row",labels_col = group,labels_row = topGenes,fontsize_row = 5,fontsize_col = 5)
+```
+
+## ヒートマップ用のデータ準備
+```{r,echo=T,eval=F,warning=F,message=F}
+ntop = 100
+BasalvsLP = topTreat(tfit,coef="BasalvsLP",number = Inf)
+topGeneIds = BasalvsLP$ENTREZID[1:ntop]
+topGenes = BasalvsLP$SYMBOL[1:ntop]
+topExpr = lcpm[rownames(lcpm) %in% topGeneIds, ]
+```
+
+## ヒートマップの描画
+```{r,out.width="80%",fig.align="center"}
+library(pheatmap)
+pheatmap(topExpr,scale = "row",labels_col = group,
+         labels_row = topGenes,fontsize_row = 5,fontsize_col = 5)
+```
+
+## ヒートマップのアノテーション
+- 引数`annotation_col`あるいは`annotation_row`を用いる
+- 引数にはデータフレームで行名に対応したグループ情報を列ごとに指定
+- 列を増やせばいくつでもアノテーションを増やせる
+```{r}
+colAnno = data.frame(group = group)
+rownames(colAnno) = colnames(topExpr)
+colAnno
+```
+
+## ヒートマップのアノテーション
+```{r,fig.align="center"}
+pheatmap(topExpr,scale = "row",labels_col = group,
+         labels_row = topGenes,fontsize_row = 5,fontsize_col = 5,annotation_col = colAnno)
+```
+
+# 遺伝子セット解析
+## 5. 遺伝子セット解析
+- 同定した変動遺伝子群の生物学的解釈
+- 予め知られている遺伝子群と機能の対応データ（遺伝子セット）を用いて偏りを評価
+- 主に二つのアプローチがある（概念は資料二日目.pptxを参照）
+  1. Over representation test (Fisher's exact test; FET)
+  2. Gene rank-based test (Gene set enrichment analysis; GSEA)
+- 多くのパッケージが存在
+  - 今回は機能と可視化に優れた[cluterProfiler](https://bioconductor.org/packages/release/bioc/html/clusterProfiler.html)用いる
+  - 詳細なドキュメントは[ここ](https://yulab-smu.github.io/clusterProfiler-book/)参照
+
+## GSEAによる解析
+- 遺伝子ランクを用いる
+- 遺伝子ランクの大きい遺伝子群がどのパスウェイに偏るかを統計学的に検定
+    - 今回は変動の大きさを遺伝子ランクとして用いる
+```{r,echo=F,out.width="65%",fig.align="center"}
+knitr::include_graphics("~/Dropbox/matsui/gitR/LectureR/image/GSEA.png")
+```
+
+## データの準備
+- 必要なデータ
+    1. 遺伝子ランク（今回はlimmaで得た比較条件ごとのt-statisticsを用いる）
+    2. 遺伝子セット（予めclusterProfilerに用意されているものは不要）
+  - clusterProfilerでは遺伝子名にENTREZIDのみ使用可能
+  - 遺伝子ランクは予め降順に並べかえておかなければならない
+- Basal vs LPの例でKEGGを用いた例を示す
+```{r}
+BasalvsLP = topTreat(tfit,coef="BasalvsLP",number = Inf)
+rnk = BasalvsLP$t
+names(rnk) = BasalvsLP$ENTREZID
+rnk = sort(rnk,decreasing = TRUE)
+rnk[1:10]
+```
+
+## GSEAの実行
+- `geneList`に遺伝子ランクを指定
+- `nperm`にシャッフルの回数を指定（p値は$\frac{1}{nperm}$の精度になる）
+```{r,warning=F,message=F}
+library(clusterProfiler)
+library(enrichplot)
+gseaResKEGG = gseKEGG(geneList=rnk,organism='mmu',
+                      nPerm=1000,pvalueCutoff=0.05,verbose=F)
+head(gseaResKEGG,n=3)
+```
+
+## dotplotによる図示
+- `dotplot()`関数を用いる
+```{r,warning=F,message=F,out.width="50%",fig.align="center"}
+dotplot(gseaResKEGG,showCategory=30,font.size=8)
+```
+
+## Up/Downの方向も考慮したdotplot2
+- 元々の`dotplot()`関数はUP/DOWNの方向が考慮されていない
+- [著者による修正コード](https://github.com/YuLab-SMU/DOSE/issues/20)を参照に関数dotplot2()を用意
+- `ggplot2`と`forcats`パッケージが必要
+```{r,warning=F,message=F}
+library(ggplot2)
+library(forcats)
+source("https://raw.githubusercontent.com/ymatts/LectureArchive/master/utility/dotplot2.R")
+```
+
+## Up/Downの方向も考慮したdotplot2
+```{r,out.width="80%"}
+dotplot2(gseaResKEGG,type = "up",ntop = 30,padj = 0.05,font.size = 7)
+#dotplot2(gseaResKEGG,type = "down",ntop = 30,padj = 0.05,font.size = 7)
+```
+
+## 有意な上位パスウェイ間の関連性
+```{r}
+emapplot(gseaResKEGG,showCategory = 30)
+```
+
+## GSEAの結果図示
+- `gseaplot2()`関数を用いる
+- `genesetID`引数には`gseaResKEGG`にある行の添字ないし行名を入力
+```{r,fig.align="center",out.width="50%"}
+selectGeneSet = 1
+gseaplot2(gseaResKEGG,geneSetID = selectGeneSet,
+          title = gseaResKEGG[selectGeneSet,2])
+```
+
+## GSEAの結果図示(複数の結果)
+```{r,fig.align="center",out.width="70%"}
+selectGeneSet = 1:5
+gseaplot2(gseaResKEGG,geneSetID = selectGeneSet)
+```
+
+## KEGG pathview
+- KEGGのパスウェイ図に発現変動量をマッピング
+```{r,echo=F,warning=F,message=F,fig.align="center"}
+library(pathview)
+
+lfc = BasalvsLP$logFC
+names(lfc) = BasalvsLP$ENTREZID
+selectPathway = 1
+pathview(gene.data=lfc,pathway.id=gseaResKEGG[selectPathway,1],species= "mmu",
+                    limit=list(gene=max(abs(lfc)), cpd=1))
+knitr::include_graphics("~/Dropbox/matsui/gitR/LectureR/mmu04510.pathview.png")
+```
+
+## KEGG pathviewの準備
+- Log fold changeを用意しておく
+```{r,echo=T,warning=F,message=F,fig.align="center"}
+library(pathview)
+lfc = BasalvsLP$logFC
+names(lfc) = BasalvsLP$ENTREZID
+```
+
+## KEGG pathviewの描画
+- `gene.data`にLog Fold Changeを指定
+- `limit`引数にはLFCの範囲
+    - `cpd`は今回は用いないためデフォルト値を指定しておく
+- 結果は作業フォルダに"**pathview.png"という画像ファイルが保存される
+```{r,warning=F,message=F}
+selectPathway = 1
+pathview(gene.data=lfc,pathway.id=gseaResKEGG[selectPathway,1],species= "mmu",
+                    limit=list(gene=max(abs(lfc),cpd=1)))
+```
+
+## 有意パスウェイに基づく変動遺伝子の分類
+```{r,out.width="80%"}
+heatplot(gseaResKEGG,showCategory = 10,foldChange = lfc)
+```
+
+
+## コンセプトネットワーク
+```{r,out.width="80%"}
+edox = setReadable(gseaResKEGG,"Mus.musculus","ENTREZID")
+cnetplot(edox,showCategory = 3,foldChange = lfc)
+```
+
+## Over representation analysis (Fisher's exact test)
+- 変動遺伝子群のリストから遺伝子セットにおける「頻度的な偏り」を検定
+- 遺伝子ランクがない場合や特定の遺伝子群の偏りを評価したい場合に用いる
+```{r,echo=F,out.width="60%",fig.align="center"}
+knitr::include_graphics("~/Dropbox/matsui/gitR/LectureR/image/FET.png")
+```
+
+## GSEAと手順が異なる点
+- 用意するのは遺伝子ランクではなく変動遺伝子リスト
+- 偏りを評価するには`enrchKEGG()`関数
+    - `geneList`引数に代入するものが変動遺伝子リスト
+- 他の可視化等は同じ
+```{r,eval=F}
+sigGenes = BasalvsLP$adj.P.Val <= 1e-5
+geneList = BasalvsLP$ENTREZID[sigGenes]
+fetResKEGG = enrichKEGG(gene=gene,organism='mmu',pvalueCutoff = 0.05)
+```

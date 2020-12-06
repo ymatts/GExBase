@@ -5,6 +5,7 @@ Version: 0.99.0
 Author: Yusuke Matsui
 Maintainer: mail.to.matsui@gmail.com <mail.to.matsui@gmail.com>
 Description: A package that provides statistical and machine learning methods for gene expression and protein abundance analysis.
+Import: data.table,limma,edgeR,pcaMethods
 License: GPL3
 Encoding: UTF-8
 LazyData: true
